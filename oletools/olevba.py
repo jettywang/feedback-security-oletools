@@ -517,9 +517,51 @@ class UnexpectedDataError(OlevbaBaseException):
             'expected {2} but found {3:04X}!'
             .format(stream_path, variable, es, value))
         self.stream_path = stream_path
-        self.variable = variable
-        self.expected = expected
-        self.value = value
+
+
+class DecompressionError(OlevbaBaseException, ValueError):
+    """
+    Raised when an MS-OVBA compressed stream is malformed, e.g. a copy token
+    references data outside the current chunk, a declared chunk size does not
+    match the available compressed data, or a chunk header is invalid.
+
+    Inheriting from ValueError keeps backward compatibility with callers that
+    catch ValueError around decompress_stream.
+    """
+
+    def __init__(self, msg, stream_path=None):
+        # call ValueError/Exception explicitly: OlevbaBaseException.__init__
+        # has a different (keyword) signature and is not the cooperative target
+        ValueError.__init__(self, msg)
+        self.msg = msg
+        self.filename = None
+        self.orig_exc = None
+        self.stream_path = stream_path
+
+
+class DecompressionBudgetError(DecompressionError):
+    """
+    Raised when decompressing a stream would produce more bytes than allowed by
+    the decompression budget. Unlike DecompressionError, the stream itself is not
+    necessarily corrupt: the shared budget across all modules of a document was
+    exhausted. Modules already extracted before this point remain valid.
+    """
+
+    def __init__(self, budget, produced, stream_path=None,
+                 module_name=None, remaining_modules=None):
+        self.budget = budget
+        self.produced = produced
+        self.module_name = module_name
+        self.remaining_modules = list(remaining_modules) if remaining_modules else []
+        msg = ('VBA decompression budget of {0} bytes exhausted while '
+               'decompressing {1}: {2} bytes produced so far'
+               .format(budget,
+                       stream_path if stream_path is not None else 'a stream',
+                       produced))
+        if self.remaining_modules:
+            msg += ', modules not checked: {0}'.format(
+                ', '.join(self.remaining_modules))
+        super(DecompressionBudgetError, self).__init__(msg, stream_path)
 
 #--- CONSTANTS ----------------------------------------------------------------
 
@@ -1297,6 +1339,63 @@ def is_printable(s):
     return set(s).issubset(_PRINTABLE_SET)
 
 
+# MS-OVBA 2.4.1.3.12: a DecompressedChunk always holds at most 4096 bytes.
+MAX_DECOMPRESSED_CHUNK_SIZE = 4096
+
+# Default upper bound (in bytes) on the total amount of data decompressed from
+# all the VBA streams of one document. This limits the expansion ratio that a
+# malicious compressed stream can force (decompression bombs). Can be overridden
+# per VBA_Parser via the decompression_budget parameter.
+DEFAULT_MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024  # 100 MiB
+
+
+class DecompressionBudget(object):
+    """
+    Shared counter tracking how many bytes have been decompressed across all
+    the streams (dir stream and every VBA module) of one document, so that the
+    total expansion stays below a configured limit.
+
+    One instance is created per VBA_Parser and passed down to every call of
+    decompress_stream. A single module that is corrupt raises
+    DecompressionError, whereas exhausting this shared budget raises
+    DecompressionBudgetError, letting callers tell the two situations apart.
+    """
+
+    def __init__(self, max_size=DEFAULT_MAX_DECOMPRESSED_SIZE):
+        #: maximum number of decompressed bytes allowed in total
+        self.max_size = max_size
+        #: number of decompressed bytes charged so far
+        self.used = 0
+        #: names of streams already fully decompressed
+        self.decompressed_streams = []
+        #: True once the budget has been exhausted
+        self.exhausted = False
+
+    @property
+    def remaining(self):
+        return max(0, self.max_size - self.used)
+
+    def check(self, additional, stream_path=None, module_name=None,
+              remaining_modules=None):
+        """
+        Reserve additional decompressed bytes, raising
+        DecompressionBudgetError if the total would exceed the budget.
+        """
+        if additional < 0:
+            raise ValueError('additional size must be positive')
+        if self.used + additional > self.max_size:
+            self.exhausted = True
+            raise DecompressionBudgetError(
+                self.max_size, self.used + additional,
+                stream_path=stream_path, module_name=module_name,
+                remaining_modules=remaining_modules)
+        self.used += additional
+
+    def commit_stream(self, stream_path, size):
+        """Record that one stream was fully decompressed."""
+        self.decompressed_streams.append((stream_path, size))
+
+
 def copytoken_help(decompressed_current, decompressed_chunk_start):
     """
     compute bit masks to decode a CopyToken according to MS-OVBA 2.4.1.3.19.1 CopyToken Help
@@ -1314,13 +1413,24 @@ def copytoken_help(decompressed_current, decompressed_chunk_start):
     return length_mask, offset_mask, bit_count, maximum_length
 
 
-def decompress_stream(compressed_container):
+def decompress_stream(compressed_container, budget=None, stream_path=None,
+                      module_name=None, remaining_modules=None):
     """
     Decompress a stream according to MS-OVBA section 2.4.1
 
     :param compressed_container bytearray: bytearray or bytes compressed according to the MS-OVBA 2.4.1.3.6 Compression algorithm
+    :param DecompressionBudget budget: optional shared budget limiting the total
+        number of decompressed bytes across all streams of a document. If the
+        budget is exhausted, DecompressionBudgetError is raised.
+    :param str stream_path: optional OLE path of the compressed stream, used in
+        error/budget messages
+    :param str module_name: optional VBA module name, used in budget messages
+    :param list remaining_modules: optional names of modules that have not been
+        checked yet, reported when the budget is exhausted
     :return: the decompressed container as a bytes string
     :rtype: bytes
+    :raises DecompressionError: if the compressed stream is malformed
+    :raises DecompressionBudgetError: if decompressing would exceed the budget
     """
     # 2.4.1.2 State Variables
 
@@ -1347,21 +1457,32 @@ def decompress_stream(compressed_container):
         compressed_container = bytearray(compressed_container)
         # raise TypeError('decompress_stream requires a bytearray as input')
     log.debug('decompress_stream: compressed size = {} bytes'.format(len(compressed_container)))
+    compressed_end_total = len(compressed_container)
+    if compressed_end_total == 0:
+        raise DecompressionError(
+            'empty VBA compressed stream', stream_path=stream_path)
     decompressed_container = bytearray()  # result
     compressed_current = 0
 
     sig_byte = compressed_container[compressed_current]
     if sig_byte != 0x01:
-        raise ValueError('invalid signature byte {0:02X}'.format(sig_byte))
+        raise DecompressionError(
+            'invalid signature byte {0:02X}'.format(sig_byte),
+            stream_path=stream_path)
 
     compressed_current += 1
 
     #NOTE: the definition of CompressedRecordEnd is ambiguous. Here we assume that
     # CompressedRecordEnd = len(compressed_container)
-    while compressed_current < len(compressed_container):
+    while compressed_current < compressed_end_total:
         # 2.4.1.1.5
         compressed_chunk_start = compressed_current
-        # chunk header = first 16 bits
+        # chunk header = first 16 bits; reject a truncated header instead of
+        # letting struct.unpack raise an opaque error
+        if compressed_chunk_start + 2 > compressed_end_total:
+            raise DecompressionError(
+                'truncated CompressedChunk header at offset {0}'
+                .format(compressed_chunk_start), stream_path=stream_path)
         compressed_chunk_header = \
             struct.unpack("<H", compressed_container[compressed_chunk_start:compressed_chunk_start + 2])[0]
         # chunk size = 12 first bits of header + 3
@@ -1369,7 +1490,9 @@ def decompress_stream(compressed_container):
         # chunk signature = 3 next bits - should always be 0b011
         chunk_signature = (compressed_chunk_header >> 12) & 0x07
         if chunk_signature != 0b011:
-            raise ValueError('Invalid CompressedChunkSignature in VBA compressed stream')
+            raise DecompressionError(
+                'Invalid CompressedChunkSignature in VBA compressed stream',
+                stream_path=stream_path)
         # chunk flag = next bit - 1 == compressed, 0 == uncompressed
         chunk_flag = (compressed_chunk_header >> 15) & 0x01
         log.debug("chunk size = {}, offset = {}, compressed flag = {}".format(chunk_size, compressed_chunk_start, chunk_flag))
@@ -1380,24 +1503,42 @@ def decompress_stream(compressed_container):
         # in chunk header before adding 3.
         # Also the first test is not useful since a 12 bits value cannot be larger than 4095.
         if chunk_flag == 1 and chunk_size > 4098:
-            raise ValueError('CompressedChunkSize=%d > 4098 but CompressedChunkFlag == 1' % chunk_size)
+            raise DecompressionError(
+                'CompressedChunkSize=%d > 4098 but CompressedChunkFlag == 1'
+                % chunk_size, stream_path=stream_path)
         if chunk_flag == 0 and chunk_size != 4098:
-            raise ValueError('CompressedChunkSize=%d != 4098 but CompressedChunkFlag == 0' % chunk_size)
-
-        # check if chunk_size goes beyond the compressed data, instead of silently cutting it:
-        #TODO: raise an exception?
-        if compressed_chunk_start + chunk_size > len(compressed_container):
-            log.warning('Chunk size is larger than remaining compressed data')
-        compressed_end = min([len(compressed_container), compressed_chunk_start + chunk_size])
+            raise DecompressionError(
+                'CompressedChunkSize=%d != 4098 but CompressedChunkFlag == 0'
+                % chunk_size, stream_path=stream_path)
+        # chunks cover the compressed container contiguously, so a declared
+        # size that runs past the end of the data means a corrupt stream
+        if compressed_chunk_start + chunk_size > compressed_end_total:
+            raise DecompressionError(
+                'CompressedChunkSize=%d at offset %d extends beyond the '
+                'compressed data (%d bytes)'
+                % (chunk_size, compressed_chunk_start, compressed_end_total),
+                stream_path=stream_path)
+        compressed_end = compressed_chunk_start + chunk_size
         # read after chunk header:
         compressed_current = compressed_chunk_start + 2
 
         if chunk_flag == 0:
             # MS-OVBA 2.4.1.3.3 Decompressing a RawChunk
             # uncompressed chunk: read the next 4096 bytes as-is
-            #TODO: check if there are at least 4096 bytes left
-            decompressed_container.extend(compressed_container[compressed_current:compressed_current + 4096])
-            compressed_current += 4096
+            if compressed_end - compressed_current != MAX_DECOMPRESSED_CHUNK_SIZE:
+                raise DecompressionError(
+                    'raw chunk at offset %d contains %d data bytes, expected %d'
+                    % (compressed_chunk_start,
+                       compressed_end - compressed_current,
+                       MAX_DECOMPRESSED_CHUNK_SIZE),
+                    stream_path=stream_path)
+            if budget is not None:
+                budget.check(MAX_DECOMPRESSED_CHUNK_SIZE,
+                             stream_path=stream_path, module_name=module_name,
+                             remaining_modules=remaining_modules)
+            decompressed_container.extend(
+                compressed_container[compressed_current:compressed_end])
+            compressed_current = compressed_end
         else:
             # MS-OVBA 2.4.1.3.2 Decompressing a CompressedChunk
             # compressed chunk
@@ -1420,13 +1561,20 @@ def decompress_stream(compressed_container):
                     #log.debug('bit_index=%d: flag_bit=%d' % (bit_index, flag_bit))
                     if flag_bit == 0:  # LiteralToken
                         # copy one byte directly to output
+                        if budget is not None:
+                            budget.check(1, stream_path=stream_path,
+                                         module_name=module_name,
+                                         remaining_modules=remaining_modules)
                         decompressed_container.extend([compressed_container[compressed_current]])
                         compressed_current += 1
                     else:  # CopyToken
                         # MS-OVBA 2.4.1.3.19.2 Unpack CopyToken
+                        if compressed_current + 2 > compressed_end:
+                            raise DecompressionError(
+                                'truncated CopyToken at offset %d'
+                                % compressed_current, stream_path=stream_path)
                         copy_token = \
                             struct.unpack("<H", compressed_container[compressed_current:compressed_current + 2])[0]
-                        #TODO: check this
                         length_mask, offset_mask, bit_count, _ = copytoken_help(
                             len(decompressed_container), decompressed_chunk_start)
                         length = (copy_token & length_mask) + 3
@@ -1435,9 +1583,42 @@ def decompress_stream(compressed_container):
                         offset = (temp1 >> temp2) + 1
                         #log.debug('offset=%d length=%d' % (offset, length))
                         copy_source = len(decompressed_container) - offset
+                        # a CopyToken may only reference bytes inside the current
+                        # DecompressedChunk (MS-OVBA 2.4.1.3.19); an offset that
+                        # points before the chunk start is a corrupt stream
+                        if copy_source < decompressed_chunk_start:
+                            raise DecompressionError(
+                                'CopyToken offset %d references data before '
+                                'the start of the current chunk (chunk starts '
+                                'at %d, output length %d) at compressed '
+                                'offset %d'
+                                % (offset, decompressed_chunk_start,
+                                   len(decompressed_container),
+                                   compressed_current),
+                                stream_path=stream_path)
+                        # the chunk cannot grow beyond 4096 decompressed bytes
+                        chunk_output_length = (len(decompressed_container)
+                                               - decompressed_chunk_start)
+                        if chunk_output_length + length > MAX_DECOMPRESSED_CHUNK_SIZE:
+                            raise DecompressionError(
+                                'CopyToken of length %d would expand the '
+                                'chunk beyond %d bytes'
+                                % (length, MAX_DECOMPRESSED_CHUNK_SIZE),
+                                stream_path=stream_path)
+                        if budget is not None:
+                            budget.check(length, stream_path=stream_path,
+                                         module_name=module_name,
+                                         remaining_modules=remaining_modules)
                         for index in xrange(copy_source, copy_source + length):
                             decompressed_container.extend([decompressed_container[index]])
                         compressed_current += 2
+    if compressed_current != compressed_end_total:
+        raise DecompressionError(
+            'decompression stopped at offset %d of %d'
+            % (compressed_current, compressed_end_total),
+            stream_path=stream_path)
+    if budget is not None:
+        budget.commit_stream(stream_path, len(decompressed_container))
     return bytes(decompressed_container)
 
 
@@ -1486,6 +1667,12 @@ class VBA_Module(object):
         #: VBA module file name in native str format (str)
         self.filename_str = None
         self.code_path = None
+        #: parse status of the module source code:
+        #: 'ok' (extracted), 'corrupt' (malformed compressed stream) or
+        #: 'budget_exceeded' (the shared decompression budget was exhausted)
+        self.parse_status = None
+        #: error message when parse_status is not 'ok'
+        self.parse_error = None
         try:
             # 2.3.4.2.3.2.1 MODULENAME Record
             # Specifies a VBA identifier as the name of the containing MODULE Record
@@ -1625,9 +1812,43 @@ class VBA_Module(object):
             log.debug("length of code_data = {0}".format(len(code_data)))
             log.debug("offset of code_data = {0}".format(self.textoffset))
             code_data = code_data[self.textoffset:]
+            if project.budget_exceeded:
+                # the shared budget was exhausted by an earlier module: parse
+                # this module's metadata (needed for dir-stream alignment) but
+                # do not attempt to decompress its source code
+                self.parse_status = 'budget_exceeded'
+                self.parse_error = project.budget_error
+                log.warning('Skipping decompression of module %s: budget '
+                            'already exhausted' % self.name_str)
+                return
             if len(code_data) > 0:
-                code_data = decompress_stream(bytearray(code_data))
+                try:
+                    code_data = decompress_stream(
+                        bytearray(code_data), budget=project.decompression_budget,
+                        stream_path=self.code_path, module_name=self.name_str,
+                        remaining_modules=project.pending_module_names(module_index))
+                except DecompressionBudgetError as exc:
+                    # the stream itself may be valid, but the shared budget for
+                    # the whole document is exhausted: keep findings from the
+                    # modules already extracted and stop processing this one
+                    self.parse_status = 'budget_exceeded'
+                    self.parse_error = exc
+                    project.budget_exceeded = True
+                    project.budget_error = exc
+                    log.warning('Decompression budget exhausted on module %s: %s'
+                                % (self.name_str, exc))
+                    return
+                except DecompressionError as exc:
+                    # only this module is corrupt: record it and continue with
+                    # the other modules instead of aborting the whole project
+                    self.parse_status = 'corrupt'
+                    self.parse_error = exc
+                    project.corrupt_modules.append(self.name_str)
+                    log.warning('Corrupt compressed VBA stream in module %s: %s'
+                                % (self.name_str, exc))
+                    return
                 # store the raw code encoded as bytes with the project's code page:
+                self.parse_status = 'ok'
                 self.code_raw = code_data
                 # decode it to unicode:
                 self.code = project.decode_bytes(code_data)
@@ -1640,6 +1861,7 @@ class VBA_Module(object):
                 log.debug('extracted file {0}'.format(self.filename_str))
             else:
                 log.warning("module stream {0} has code data length 0".format(self.streamname_str))
+                self.parse_status = 'ok'
         except (UnexpectedDataError, SubstreamOpenError):
             raise
         except Exception as exc:
@@ -1659,7 +1881,8 @@ class VBA_Project(object):
     metadata and VBA modules.
     """
 
-    def __init__(self, ole, vba_root, project_path, dir_path, relaxed=True):
+    def __init__(self, ole, vba_root, project_path, dir_path, relaxed=True,
+                 decompression_budget=None):
         """
         Extract VBA macros from an OleFileIO object.
 
@@ -1667,6 +1890,8 @@ class VBA_Project(object):
         :param project_path: path to the PROJECT stream
         :param relaxed: If True, only create info/debug log entry if data is not as expected
                         (e.g. opening substream fails); if False, raise an error in this case
+        :param DecompressionBudget decompression_budget: optional shared budget
+                        limiting the total amount of decompressed VBA data
         """
         self.ole = ole
         self.vba_root = vba_root
@@ -1675,13 +1900,31 @@ class VBA_Project(object):
         self.relaxed = relaxed
         #: VBA modules contained in the project (list of VBA_Module objects)
         self.modules = []
+        #: number of modules declared by the PROJECTMODULES record, set in
+        #: parse_modules; default 0 so module-level error handling can use it
+        self.modules_count = 0
         #: file extension for each VBA module
         self.module_ext = {}
+        #: shared budget for decompressed bytes across all streams
+        self.decompression_budget = decompression_budget
+        #: names of modules whose compressed stream is corrupt
+        self.corrupt_modules = []
+        #: names of modules that were never checked (budget exhausted before
+        #: they were reached, or a previous module could not be processed)
+        self.unchecked_modules = []
+        #: True once the decompression budget has been exhausted
+        self.budget_exceeded = False
+        #: the DecompressionBudgetError that exhausted the budget, if any
+        self.budget_error = None
         log.debug('Parsing the dir stream from %r' % dir_path)
         # read data from dir stream (compressed)
         dir_compressed = ole.openstream(dir_path).read()
-        # decompress it:
-        dir_stream = BytesIO(decompress_stream(bytearray(dir_compressed)))
+        # decompress it. The dir stream is metadata rather than macro source,
+        # so it is not charged against the macro decompression budget; it is
+        # still protected by the per-chunk 4096-byte limit in decompress_stream.
+        dir_stream = BytesIO(decompress_stream(
+            bytearray(dir_compressed), budget=None, stream_path=dir_path,
+            module_name='dir'))
         # store reference for later use:
         self.dir_stream = dir_stream
 
@@ -2064,6 +2307,32 @@ class VBA_Project(object):
                 elif name == 'BaseClass':
                     self.module_ext[value] = FORM_EXTENSION
 
+    def pending_module_names(self, current_index):
+        """
+        Names of the modules not checked yet when the budget is exhausted on
+        the module at current_index (the modules following current_index,
+        whose names are not known until their dir record is parsed).
+        """
+        return ['module#{0}'.format(index)
+                for index in xrange(current_index, self.modules_count)]
+
+    def decompression_status_message(self):
+        """Human-readable summary of the decompression outcome."""
+        if self.budget_exceeded:
+            message = 'decompression budget exhausted'
+            if self.decompression_budget is not None:
+                message += ' ({0}/{1} bytes)'.format(
+                    self.decompression_budget.used,
+                    self.decompression_budget.max_size)
+            if self.unchecked_modules:
+                message += '; modules not checked: {0}'.format(
+                    ', '.join(self.unchecked_modules))
+            return message
+        if self.corrupt_modules:
+            return 'corrupt module(s): {0}'.format(
+                ', '.join(self.corrupt_modules))
+        return 'ok'
+
     def parse_modules(self):
         dir_stream = self.dir_stream
         # projectmodules_id has already been read by the previous loop = 0x000F
@@ -2081,8 +2350,40 @@ class VBA_Project(object):
 
         log.debug("parsing {0} modules".format(self.modules_count))
         for module_index in xrange(0, self.modules_count):
+            # once the shared budget is exhausted, the remaining modules cannot
+            # be checked anymore; record them so the report can name them
+            if self.budget_exceeded:
+                self.unchecked_modules.extend(
+                    self.pending_module_names(module_index))
+                log.warning('Skipping %d unchecked VBA module(s) because the '
+                            'decompression budget is exhausted: %s'
+                            % (self.modules_count - module_index,
+                               ', '.join(self.unchecked_modules)))
+                break
             module = VBA_Module(self, self.dir_stream, module_index=module_index)
             self.modules.append(module)
+            if module.parse_status == 'budget_exceeded':
+                self.unchecked_modules.append(module.name_str)
+                # the modules after this one still have to be parsed from the
+                # dir stream to keep alignment, but will be marked unchecked
+                for later_index in xrange(module_index + 1,
+                                          self.modules_count):
+                    later = VBA_Module(self, self.dir_stream,
+                                       module_index=later_index)
+                    self.modules.append(later)
+                    self.unchecked_modules.append(
+                        later.name_str if later.name_str
+                        else 'module#{0}'.format(later_index))
+                log.warning('VBA module %s not extracted (budget exceeded); '
+                            'unchecked modules: %s'
+                            % (module.name_str,
+                               ', '.join(self.unchecked_modules) or 'none'))
+                break
+            if module.parse_status == 'corrupt':
+                log.warning('VBA module %s not extracted (corrupt compressed '
+                            'stream), continuing with the remaining modules'
+                            % module.name_str)
+                continue
             yield (module.code_path, module.filename_str, module.code_str)
         _ = unused   # make pylint happy: now variable "unused" is being used ;-)
         return
@@ -2098,7 +2399,8 @@ class VBA_Project(object):
 
 
 
-def _extract_vba(ole, vba_root, project_path, dir_path, relaxed=True):
+def _extract_vba(ole, vba_root, project_path, dir_path, relaxed=True,
+                 decompression_budget=None):
     """
     Extract VBA macros from an OleFileIO object.
     Internal function, do not call directly.
@@ -2107,11 +2409,14 @@ def _extract_vba(ole, vba_root, project_path, dir_path, relaxed=True):
     vba_project: path to the PROJECT stream
     :param relaxed: If True, only create info/debug log entry if data is not as expected
                     (e.g. opening substream fails); if False, raise an error in this case
+    :param DecompressionBudget decompression_budget: optional shared budget
+                    limiting the total amount of decompressed VBA data
     This is a generator, yielding (stream path, VBA filename, VBA source code) for each VBA code stream
     """
     log.debug('relaxed is %s' % relaxed)
 
-    project = VBA_Project(ole, vba_root, project_path, dir_path, relaxed)
+    project = VBA_Project(ole, vba_root, project_path, dir_path, relaxed,
+                          decompression_budget=decompression_budget)
     project.parse_project_stream()
 
     for code_path, filename, code_data in project.parse_modules():
@@ -2681,7 +2986,7 @@ class VBA_Parser(object):
     # TODO: relaxed is enabled by default temporarily, until a solution is found for issue #593
 
     def __init__(self, filename, data=None, container=None, relaxed=True, encoding=DEFAULT_API_ENCODING,
-                 disable_pcode=False):
+                 disable_pcode=False, decompression_budget=DEFAULT_MAX_DECOMPRESSED_SIZE):
         """
         Constructor for VBA_Parser
 
@@ -2699,6 +3004,10 @@ class VBA_Parser(object):
 
         :param str encoding: encoding for VBA source code and strings.
             Default: UTF-8 bytes strings on Python 2, unicode strings on Python 3 (None)
+
+        :param int decompression_budget: maximum total number of bytes that may
+            be decompressed from all the VBA streams of this document, limiting
+            decompression-bomb expansion. None disables the limit.
 
         raises a FileOpenError if all attempts to interpret the data header failed.
         """
@@ -2719,6 +3028,13 @@ class VBA_Parser(object):
         self.filename = filename
         self.container = container
         self.relaxed = relaxed
+        #: shared budget limiting the total amount of decompressed VBA data
+        self.decompression_budget = DecompressionBudget(decompression_budget) \
+            if decompression_budget is not None else None
+        #: VBA projects whose budget was exhausted while extracting modules
+        self.budget_exceeded_projects = []
+        #: VBA projects containing one or more corrupt module streams
+        self.corrupt_module_projects = []
         self.type = None
         self.vba_projects = None
         self.vba_forms = None
@@ -3175,10 +3491,15 @@ class VBA_Parser(object):
         """
         Create sub-parser for given subfile/data and append to subfiles.
         """
-        self.ole_subfiles.append(VBA_Parser(filename, data, container,
-                                            relaxed=self.relaxed,
-                                            encoding=self.encoding,
-                                            disable_pcode=self.disable_pcode))
+        sub_parser = VBA_Parser(filename, data, container,
+                                relaxed=self.relaxed,
+                                encoding=self.encoding,
+                                disable_pcode=self.disable_pcode,
+                                decompression_budget=None)
+        # share the same decompression budget across all OLE subfiles of one
+        # document, since the limit applies to the whole document
+        sub_parser.decompression_budget = self.decompression_budget
+        self.ole_subfiles.append(sub_parser)
 
     def find_vba_projects(self):
         """
@@ -3543,22 +3864,40 @@ class VBA_Parser(object):
             vba_stream_ids = set()
             for vba_root, project_path, dir_path in self.vba_projects:
                 # extract all VBA macros from that VBA root storage:
-                # The function _extract_vba may fail on some files (issue #132)
-                # TODO: refactor this loop, because if one module fails it stops parsing,
-                #  and the error is only logged, not stored for reporting anomalies
+                # The VBA project parsing may fail on some files (issue #132)
                 try:
+                    vba_project = VBA_Project(
+                        self.ole_file, vba_root, project_path, dir_path,
+                        self.relaxed,
+                        decompression_budget=self.decompression_budget)
+                    vba_project.parse_project_stream()
                     for stream_path, vba_filename, vba_code in \
-                            _extract_vba(self.ole_file, vba_root, project_path,
-                                         dir_path, self.relaxed):
+                            vba_project.parse_modules():
                         # store direntry ids in a set:
                         vba_stream_ids.add(self.ole_file._find(stream_path))
                         yield (self.filename, stream_path, vba_filename, vba_code)
+                    if vba_project.budget_exceeded:
+                        self.budget_exceeded_projects.append(
+                            (vba_root, vba_project))
+                    if vba_project.corrupt_modules:
+                        self.corrupt_module_projects.append(
+                            (vba_root, vba_project))
+                except DecompressionBudgetError as exc:
+                    # the budget was exhausted (e.g. while decompressing the
+                    # dir stream); findings yielded before the failure are kept
+                    log.warning('Decompression budget exhausted: %s' % exc)
+                    self.budget_exceeded_projects.append((vba_root, exc))
                 except Exception as e:
                     log.exception('Error in _extract_vba')
             # Also look for VBA code in any stream including orphans
             # (happens in some malformed files)
             ole = self.ole_file
             for sid in xrange(len(ole.direntries)):
+                # once the budget is exhausted there is no point scanning more
+                # orphan streams, they could not be decompressed anyway
+                if self.decompression_budget is not None and \
+                        self.decompression_budget.exhausted:
+                    break
                 # check if id is already done above:
                 log.debug('Checking DirEntry #%d' % sid)
                 if sid in vba_stream_ids:
@@ -3578,7 +3917,10 @@ class VBA_Parser(object):
                         log.debug('Found VBA compressed code at index %X' % start)
                         compressed_code = data[start:]
                         try:
-                            vba_code_bytes = decompress_stream(bytearray(compressed_code))
+                            vba_code_bytes = decompress_stream(
+                                bytearray(compressed_code),
+                                budget=self.decompression_budget,
+                                stream_path=d.name)
                             # vba_code_bytes is in bytes, we need to convert it to str
                             # but here we don't know the encoding of the VBA project
                             # (for example code page 1252 or 1251), because it's in the
@@ -3588,6 +3930,18 @@ class VBA_Parser(object):
                             # TODO get the actual encoding from the VBA_Project
                             vba_code_str = bytes2str(vba_code_bytes, encoding='cp1252')
                             yield (self.filename, d.name, d.name, vba_code_str)
+                        except DecompressionBudgetError as exc:
+                            log.warning('Decompression budget exhausted while '
+                                        'scanning orphan stream %r: %s'
+                                        % (d.name, exc))
+                            if not any(root == self.filename
+                                       for root, _ in self.budget_exceeded_projects):
+                                self.budget_exceeded_projects.append(
+                                    (self.filename, exc))
+                            break
+                        except DecompressionError as exc:
+                            log.info('Corrupt compressed stream %r in file %r: %s'
+                                     % (d.name, self.filename, exc))
                         except Exception as exc:
                             # display the exception with full stack trace for debugging
                             log.debug('Error processing stream %r in file %r (%s)' % (d.name, self.filename, exc))
@@ -3606,6 +3960,94 @@ class VBA_Parser(object):
                 for line in self.pcodedmp_output.splitlines():
                     vba_code += "' " + line + '\n'
                 yield ('VBA P-code', 'VBA P-code', 'VBA_P-code.txt', vba_code)
+
+
+    def get_decompression_report(self):
+        """
+        Summarize the outcome of the VBA decompression-budget checks.
+
+        This must be called after extract_macros/extract_all_macros. It lets
+        callers distinguish a single corrupt module from an exhausted total
+        budget, and lists which modules were never checked.
+
+        :return: dict with keys:
+            - budget (int or None): configured budget in bytes
+            - decompressed_bytes (int): bytes actually decompressed
+            - budget_exceeded (bool): True if the budget was exhausted
+            - corrupt_modules (list): names of modules with malformed streams
+            - unchecked_modules (list): names of modules not checked
+            - errors (list): human-readable messages
+        """
+        report = {
+            'budget': self.decompression_budget.max_size
+                      if self.decompression_budget is not None else None,
+            'decompressed_bytes': self.decompression_budget.used
+                      if self.decompression_budget is not None else 0,
+            'budget_exceeded': self.decompression_budget.exhausted
+                      if self.decompression_budget is not None else False,
+            'corrupt_modules': [],
+            'unchecked_modules': [],
+            'errors': [],
+        }
+        for _root, item in self.budget_exceeded_projects:
+            report['budget_exceeded'] = True
+            if isinstance(item, VBA_Project):
+                report['unchecked_modules'].extend(item.unchecked_modules)
+                report['errors'].append(item.decompression_status_message())
+            elif isinstance(item, DecompressionBudgetError):
+                report['unchecked_modules'].extend(item.remaining_modules)
+                report['errors'].append(str(item))
+            else:
+                report['errors'].append(str(item))
+        for _root, project in self.corrupt_module_projects:
+            report['corrupt_modules'].extend(project.corrupt_modules)
+            report['unchecked_modules'].extend(project.unchecked_modules)
+        # OLE subfiles (OpenXML/PPT) own the VBA_Project instances, so pull
+        # their per-project status into the report as well
+        for sub_parser in self.ole_subfiles:
+            sub_report = sub_parser.get_decompression_report()
+            report['budget_exceeded'] = (report['budget_exceeded']
+                                         or sub_report['budget_exceeded'])
+            report['corrupt_modules'].extend(sub_report['corrupt_modules'])
+            report['unchecked_modules'].extend(sub_report['unchecked_modules'])
+            report['errors'].extend(sub_report['errors'])
+        # de-duplicate while keeping order
+        report['corrupt_modules'] = list(dict.fromkeys(report['corrupt_modules']))
+        report['unchecked_modules'] = list(dict.fromkeys(report['unchecked_modules']))
+        return report
+
+
+    def print_decompression_report(self):
+        """Print the decompression-budget status on the standard output."""
+        # collect status from nested OLE subfiles (OpenXML/PPT) as well
+        reports = [self.get_decompression_report()]
+        reports.extend(sub.get_decompression_report()
+                       for sub in self.ole_subfiles)
+        budget = reports[0]['budget']
+        total_decompressed = sum(r['decompressed_bytes'] for r in reports)
+        corrupt = list(dict.fromkeys(
+            name for r in reports for name in r['corrupt_modules']))
+        unchecked = list(dict.fromkeys(
+            name for r in reports for name in r['unchecked_modules']))
+        exceeded = any(r['budget_exceeded'] for r in reports)
+
+        print('-' * 79)
+        print('VBA DECOMPRESSION BUDGET:')
+        if budget is None:
+            print('  Budget limit: disabled')
+        else:
+            print('  Budget limit: {0} bytes'.format(budget))
+        print('  Decompressed: {0} bytes'.format(total_decompressed))
+        if corrupt:
+            print('  Corrupt module(s): {0}'.format(', '.join(corrupt)))
+        if exceeded:
+            print('  Status: BUDGET EXCEEDED - findings above are partial')
+        elif corrupt:
+            print('  Status: completed with corrupt module(s)')
+        else:
+            print('  Status: OK')
+        if unchecked:
+            print('  Module(s) not checked: {0}'.format(', '.join(unchecked)))
 
 
     def extract_all_macros(self):
@@ -4233,6 +4675,9 @@ class VBA_Parser_CLI(VBA_Parser):
                 if show_deobfuscated_code:
                     print('MACRO SOURCE CODE WITH DEOBFUSCATED VBA STRINGS (EXPERIMENTAL):\n\n')
                     print(self.reveal())
+                # show the decompression-budget status, including any corrupt
+                # module or modules left unchecked when the budget was exhausted
+                self.print_decompression_report()
             else:
                 print('No VBA or XLM macros found.')
         except OlevbaBaseException:
@@ -4315,6 +4760,7 @@ class VBA_Parser_CLI(VBA_Parser):
                 if show_pcode:
                     result['pcode'] = self.extract_pcode()
             result['macros'] = macros
+            result['decompression_report'] = self.get_decompression_report()
             result['json_conversion_successful'] = True
         except Exception as exc:
             # display the exception with full stack trace for debugging
@@ -4448,6 +4894,13 @@ def parse_args(cmd_line_args=None):
                         help='Disable extraction and analysis of pcode')
     parser.add_argument('--no-xlm', dest="no_xlm", action="store_true", default=False,
                             help="Do not extract XLM Excel macros. This may speed up analysis of large files.")
+    parser.add_argument('--decompression-budget', dest='decompression_budget',
+                        action='store', type=int,
+                        default=DEFAULT_MAX_DECOMPRESSED_SIZE,
+                        help='Maximum total number of bytes that may be '
+                             'decompressed from all the VBA streams of a file '
+                             '(decompression bomb protection). Use 0 to '
+                             'disable the limit. Default: %(default)s bytes.')
 
     options = parser.parse_args(cmd_line_args)
 
@@ -4482,7 +4935,10 @@ def process_file(filename, data, container, options, crypto_nesting=0):
         # Open the file
         vba_parser = VBA_Parser_CLI(filename, data=data, container=container,
                                     relaxed=options.relaxed,
-                                    disable_pcode=options.no_pcode)
+                                    disable_pcode=options.no_pcode,
+                                    decompression_budget=(
+                                        None if options.decompression_budget == 0
+                                        else options.decompression_budget))
 
         if options.output_mode == 'detailed':
             # fully detailed output
