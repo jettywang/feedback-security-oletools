@@ -60,8 +60,9 @@ class TestFTGuess(unittest.TestCase):
                 else:
                     expect = ftguess.FType_Generic_OLE
 
-            elif extension in ('xml', 'csv', 'odt', 'ods', 'odp', 'potx', 'potm'):
-                # not really an office file type
+            elif extension in ('xml', 'csv', 'odt', 'ods', 'odp', 'potx',
+                               'potm', 'bas'):
+                # not really an office file type (.bas is plain VBA source)
                 expect = ftguess.FType_Unknown
 
             elif extension == 'slk':

@@ -142,7 +142,10 @@ class TestOleIDBasic(unittest.TestCase):
                 print("\nTODO: need to determine result inconsistency for sample {0}"
                       .format(filename))
                 continue
-            if filename in find_vba:                   # no macros!
+            # plain VBA source modules (.bas) contain VBA code by construction
+            if filename.startswith(join('olevba', 'evidence') + os.sep):
+                self.assertIn(value_dict['vba'], ('Yes', 'Yes, suspicious'))
+            elif filename in find_vba:                   # no macros!
                 self.assertEqual(value_dict['vba'], 'Yes')
             else:
                 self.assertIn(value_dict['vba'], ('No', 'Error'))

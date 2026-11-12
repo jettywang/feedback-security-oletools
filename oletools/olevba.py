@@ -345,6 +345,7 @@ from oletools import crypto
 from oletools.common.io_encoding import ensure_stdout_handles_unicode
 from oletools.common import codepages
 from oletools import ftguess
+from oletools import macro_evidence
 from oletools.common.log_helper import log_helper
 
 # === PYTHON 2+3 SUPPORT ======================================================
@@ -2729,6 +2730,8 @@ class VBA_Parser(object):
         self.modules = None
         # Analysis results: list of tuples (type, keyword, description) - See VBA_Scanner
         self.analysis_results = None
+        # Statement-level evidence (MacroEvidenceReport) or None until built
+        self.macro_evidence = None
         # statistics for the scan summary and flags
         self.nb_macros = 0
         self.nb_autoexec = 0
@@ -3698,6 +3701,106 @@ class VBA_Parser(object):
         return self.analysis_results
 
 
+    # Keyword sets reused by build_macro_evidence: only plain keywords are
+    # supported, regex-based entries (starting with a backslash) stay in the
+    # classic analysis table.
+    def _evidence_keywords(self):
+        keywords = set()
+        for keyword_set in (AUTOEXEC_KEYWORDS, SUSPICIOUS_KEYWORDS):
+            for keyword_list in keyword_set.values():
+                for keyword in keyword_list:
+                    if keyword and not keyword.startswith('\\'):
+                        keywords.add(keyword)
+        return sorted(keywords)
+
+    def build_macro_evidence(self):
+        """
+        Build statement-level evidence for every extracted VBA module.
+
+        Unlike :meth:`analyze_macros`, each keyword occurrence is located to a
+        module and a physical line, and classified as code, string literal or
+        comment.  Procedure calls are resolved statically where possible and
+        marked as unknown when they require runtime dispatch.
+
+        :return: :class:`oletools.macro_evidence.MacroEvidenceReport`
+        """
+        if self.macro_evidence is not None:
+            return self.macro_evidence
+        analyzer = macro_evidence.MacroEvidenceAnalyzer()
+        for (_, _, vba_filename, vba_code) in self.extract_all_macros():
+            # use the module file name without extension as the module name
+            module_name = os.path.splitext(os.path.basename(vba_filename))[0]
+            analyzer.add_module(module_name, vba_code)
+        keywords = self._evidence_keywords()
+        self.macro_evidence = macro_evidence.MacroEvidenceReport(
+            keyword_evidence=analyzer.keyword_evidence(keywords),
+            procedures=analyzer.all_procedures(),
+            calls=analyzer.procedure_calls())
+        return self.macro_evidence
+
+    def print_macro_evidence(self):
+        """
+        Print the statement-level evidence report in human-readable form.
+
+        Keyword occurrences are grouped by context (code first, then string
+        literals and comments, which are not executable evidence), followed by
+        procedure call resolution.
+        """
+        report = self.build_macro_evidence()
+        context_order = (macro_evidence.RESOLUTION_CODE,
+                         macro_evidence.RESOLUTION_STRING,
+                         macro_evidence.RESOLUTION_COMMENT)
+        context_title = {
+            macro_evidence.RESOLUTION_CODE:
+                'Keyword evidence in executable code',
+            macro_evidence.RESOLUTION_STRING:
+                'Keyword occurrences inside string literals (not executed)',
+            macro_evidence.RESOLUTION_COMMENT:
+                'Keyword occurrences inside comments (not executed)',
+        }
+        print('-' * 79)
+        print('MACRO BEHAVIOUR EVIDENCE (statement-level, static analysis):')
+        grouped = {context: [] for context in context_order}
+        for item in report.keyword_evidence:
+            grouped[item.kind].append(item)
+        for context in context_order:
+            print('')
+            print(context_title[context] + ':')
+            items = grouped[context]
+            if not items:
+                print('  (none)')
+                continue
+            table = tablestream.TableStream(column_width=(18, 8, 18, 35),
+                                            header_row=('Module', 'Line',
+                                                        'Keyword', 'Statement'))
+            for item in items:
+                table.write_row((item.module, item.line, item.keyword,
+                                 item.statement))
+            table.close()
+        print('')
+        print('Procedure calls (static resolution):')
+        if not report.calls:
+            print('  (none)')
+        else:
+            table = tablestream.TableStream(
+                column_width=(16, 7, 16, 10, 16, 24),
+                header_row=('Module', 'Line', 'Callee', 'Resolution',
+                            'Target', 'Reason'))
+            for call in report.calls:
+                if call.resolution == macro_evidence.RESOLUTION_STATIC:
+                    target = '%s:%d' % (call.target_module, call.target_line)
+                    reason = ''
+                else:
+                    target = 'unknown'
+                    reason = call.reason or ''
+                table.write_row((call.module, call.line, call.callee,
+                                 call.resolution, target, reason))
+            table.close()
+        print('')
+        print('Note: calls marked "%s" require runtime data and are not '
+              'resolved statically.' % macro_evidence.RESOLUTION_UNKNOWN)
+
+
     def reveal(self):
         # we only want printable strings:
         analysis = self.analyze_macros(show_decoded_strings=False)
@@ -4125,7 +4228,8 @@ class VBA_Parser_CLI(VBA_Parser):
     def process_file(self, show_decoded_strings=False,
                      display_code=True, hide_attributes=True,
                      vba_code_only=False, show_deobfuscated_code=False,
-                     deobfuscate=False, show_pcode=False, no_xlm=False):
+                     deobfuscate=False, show_pcode=False, no_xlm=False,
+                     evidence=False):
         """
         Process a single file
 
@@ -4230,6 +4334,8 @@ class VBA_Parser_CLI(VBA_Parser):
                 if not vba_code_only:
                     # analyse the code from all modules at once:
                     self.print_analysis(show_decoded_strings, deobfuscate)
+                    if evidence:
+                        self.print_macro_evidence()
                 if show_deobfuscated_code:
                     print('MACRO SOURCE CODE WITH DEOBFUSCATED VBA STRINGS (EXPERIMENTAL):\n\n')
                     print(self.reveal())
@@ -4249,7 +4355,8 @@ class VBA_Parser_CLI(VBA_Parser):
     def process_file_json(self, show_decoded_strings=False,
                           display_code=True, hide_attributes=True,
                           vba_code_only=False, show_deobfuscated_code=False,
-                          deobfuscate=False, show_pcode=False, no_xlm=False):
+                          deobfuscate=False, show_pcode=False, no_xlm=False,
+                          evidence=False):
         """
         Process a single file
 
@@ -4310,6 +4417,8 @@ class VBA_Parser_CLI(VBA_Parser):
                     # analyse the code from all modules at once:
                     result['analysis'] = self.print_analysis_json(show_decoded_strings,
                                                                   deobfuscate)
+                    if evidence:
+                        result['macro_evidence'] = self.build_macro_evidence().as_dict()
                 if show_deobfuscated_code:
                     result['code_deobfuscated'] = self.reveal()
                 if show_pcode:
@@ -4448,6 +4557,13 @@ def parse_args(cmd_line_args=None):
                         help='Disable extraction and analysis of pcode')
     parser.add_argument('--no-xlm', dest="no_xlm", action="store_true", default=False,
                             help="Do not extract XLM Excel macros. This may speed up analysis of large files.")
+    parser.add_argument('--evidence', dest="evidence", action="store_true",
+                        default=False,
+                        help="Add statement-level macro behaviour evidence: "
+                             "locates each keyword to module and line, "
+                             "distinguishes code from strings and comments, "
+                             "and resolves static cross-module procedure "
+                             "calls (dynamic dispatch is marked unknown).")
 
     options = parser.parse_args(cmd_line_args)
 
@@ -4491,7 +4607,7 @@ def process_file(filename, data, container, options, crypto_nesting=0):
                          hide_attributes=options.hide_attributes, vba_code_only=options.vba_code_only,
                          show_deobfuscated_code=options.show_deobfuscated_code,
                          deobfuscate=options.deobfuscate, show_pcode=options.show_pcode,
-                                    no_xlm=options.no_xlm)
+                                    no_xlm=options.no_xlm, evidence=options.evidence)
         elif options.output_mode == 'triage':
             # summarized output for triage:
             vba_parser.process_file_triage(show_decoded_strings=options.show_decoded_strings,
@@ -4503,7 +4619,8 @@ def process_file(filename, data, container, options, crypto_nesting=0):
                          hide_attributes=options.hide_attributes, vba_code_only=options.vba_code_only,
                          show_deobfuscated_code=options.show_deobfuscated_code,
                          deobfuscate=options.deobfuscate, show_pcode=options.show_pcode,
-                                             no_xlm=options.no_xlm))
+                                             no_xlm=options.no_xlm,
+                                             evidence=options.evidence))
         else:  # (should be impossible)
             raise ValueError('unexpected output mode: "{0}"!'.format(options.output_mode))
         vba_parser.close()
