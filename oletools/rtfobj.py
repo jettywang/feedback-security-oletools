@@ -95,6 +95,9 @@ http://www.decalage.info/python/oletools
 # 2021-05-23 v0.60   PL: - use ftguess to identify file type of OLE Package
 #                        - fixed bug in re_executable_extensions
 # 2021-06-03 v0.60.1 PL: - fixed code to find URLs in OLE2Link objects for Py3 (issue #692)
+# 2026-11-12             - \\bin declaring a length beyond the end of data: record
+#                          the failure reason on the object (RtfObject.bin_error)
+#                          and treat the length as null, so that parsing continues
 
 from __future__ import print_function
 
@@ -376,6 +379,9 @@ class Destination(object):
         self.start = None
         self.end = None
         self.group_level = 0
+        # set when a \bin control word within this destination declares a
+        # length exceeding the remaining data (corrupted/anti-analysis trick):
+        self.bin_error = None
 
 
 # class Group(object):
@@ -595,11 +601,24 @@ class RtfParser(object):
             # it should be treated as a null length:
             binlen=0
         # ignore optional space after \bin
-        if ord(self.data[self.index:self.index + 1]) == ord(' '):
+        if self.index < self.size \
+                and ord(self.data[self.index:self.index + 1]) == ord(' '):
             log.debug('\\bin: ignoring whitespace before data')
             self.index += 1
+        # handle a declared length larger than the remaining data:
+        remaining = self.size - self.index
+        if binlen > remaining:
+            log.info('Detected anti-analysis trick: \\bin object with declared '
+                     'length %d exceeding remaining data (%d bytes) at index %X'
+                     % (binlen, remaining, self.index))
+            # record the failure reason on the current destination, and treat
+            # the declared length as null, so that parsing may continue and
+            # subsequent objects can still be identified:
+            self.current_destination.bin_error = (
+                '\\bin declared length %d exceeds remaining data '
+                '(%d bytes) at index %Xh' % (binlen, remaining, self.index))
+            binlen = 0
         log.debug('\\bin: reading %d bytes of binary data' % binlen)
-        # TODO: handle length greater than data
         bindata = self.data[self.index:self.index + binlen]
         self.index += binlen
         self.bin(bindata)
@@ -650,6 +669,9 @@ class RtfObject(object):
         # Additional OLE object data
         self.clsid = None
         self.clsid_desc = None
+        # failure reason when the object data is corrupted, e.g. a \bin
+        # control word declaring a length beyond the end of the file:
+        self.bin_error = None
 
 
 
@@ -676,6 +698,7 @@ class RtfObjParser(RtfParser):
             self.objects.append(rtfobj)
             rtfobj.start = destination.start
             rtfobj.end = destination.end
+            rtfobj.bin_error = destination.bin_error
             # Filter out all whitespaces first (just ignored):
             hexdata1 = destination.data.translate(None, b' \t\r\n\f\v')
             # Then filter out any other non-hex character:
@@ -945,6 +968,8 @@ def process_file(container, filename, data, output_dir=None, save_object=False):
                 ole_column += '\nPossibly an exploit for the Equation Editor vulnerability (VU#421280, CVE-2017-11882)'
         else:
             ole_column = 'Not a well-formed OLE object'
+        if rtfobj.bin_error is not None:
+            ole_column += '\nWARNING: corrupted object data: %s' % rtfobj.bin_error
         tstream.write_row((
             rtfp.objects.index(rtfobj),
             # filename,
