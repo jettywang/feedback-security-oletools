@@ -1,0 +1,14 @@
+cffi==2.1.1
+colorclass==2.2.2
+cryptography==50.0.2
+easygui==0.98.3
+iniconfig==2.3.1
+msoffcrypto-tool==6.1.0
+olefile==0.47
+packaging==26.3
+pcodedmp==1.2.6
+pluggy==1.7.0
+pycparser==3.12
+pygments==2.21.0
+pyparsing==3.3.3
+pytest==9.2.0
