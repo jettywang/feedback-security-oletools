@@ -1,0 +1,147 @@
+[
+  {
+    "sample": "1_encrypted_valid.docx",
+    "size": 18944,
+    "magic_ole": true,
+    "magic_zip": false,
+    "header_hex": "d0cf11e0a1b11ae1",
+    "ft_container": "OLE",
+    "ft_filetype": "OLE",
+    "msoffcrypto": {
+      "class": "OOXMLFile",
+      "is_encrypted": true,
+      "exception": null
+    },
+    "crypto_is_encrypted": true,
+    "oleid": {
+      "encrypted": true,
+      "encrypted_desc": "The file is encrypted. It may be decrypted with msoffcrypto-tool",
+      "vba_macros": "No",
+      "xlm_macros": "No",
+      "file_format": "Generic OLE file / Compound File (unknown format)",
+      "container": "OLE"
+    },
+    "olevba": {
+      "returncode": 9,
+      "macro_modules_found": 0,
+      "signal": "No VBA or XLM macros found.",
+      "stderr_tail": null
+    }
+  },
+  {
+    "sample": "2_fake_named_stream.bin",
+    "size": 2560,
+    "magic_ole": true,
+    "magic_zip": false,
+    "header_hex": "d0cf11e0a1b11ae1",
+    "ft_container": "OLE",
+    "ft_filetype": "OLE",
+    "msoffcrypto": {
+      "class": null,
+      "is_encrypted": null,
+      "exception": "ExpatError: syntax error: line 1, column 0"
+    },
+    "crypto_is_encrypted": true,
+    "oleid": {
+      "encrypted": true,
+      "encrypted_desc": "The file is encrypted. It may be decrypted with msoffcrypto-tool",
+      "vba_macros": "No",
+      "xlm_macros": "No",
+      "file_format": "Generic OLE file / Compound File (unknown format)",
+      "container": "OLE"
+    },
+    "olevba": {
+      "returncode": 8,
+      "macro_modules_found": 0,
+      "signal": "No VBA or XLM macros found.",
+      "stderr_tail": null
+    }
+  },
+  {
+    "sample": "3a_corrupted_truncated.bin",
+    "size": 154,
+    "magic_ole": true,
+    "magic_zip": false,
+    "header_hex": "d0cf11e0a1b11ae1",
+    "ft_container": "Unknown Container",
+    "ft_filetype": "Unknown File Type",
+    "msoffcrypto": {
+      "class": null,
+      "is_encrypted": null,
+      "exception": "NotOleFileError: not an OLE2 structured storage file"
+    },
+    "crypto_is_encrypted": false,
+    "oleid": {
+      "encrypted": false,
+      "encrypted_desc": "The file is not encrypted",
+      "vba_macros": "Error",
+      "xlm_macros": "No",
+      "file_format": "Unknown file type",
+      "container": "Unknown Container"
+    },
+    "olevba": {
+      "returncode": 8,
+      "macro_modules_found": 0,
+      "signal": null,
+      "stderr_tail": null
+    }
+  },
+  {
+    "sample": "3b_corrupted_fat.bin",
+    "size": 2560,
+    "magic_ole": true,
+    "magic_zip": false,
+    "header_hex": "d0cf11e0a1b11ae1",
+    "ft_container": "OLE",
+    "ft_filetype": "OLE",
+    "msoffcrypto": {
+      "class": null,
+      "is_encrypted": null,
+      "exception": "FileFormatError: Unrecognized file format"
+    },
+    "crypto_is_encrypted": false,
+    "oleid": {
+      "encrypted": false,
+      "encrypted_desc": "The file is not encrypted",
+      "vba_macros": "No",
+      "xlm_macros": "No",
+      "file_format": "Generic OLE file / Compound File (unknown format)",
+      "container": "OLE"
+    },
+    "olevba": {
+      "returncode": 0,
+      "macro_modules_found": 0,
+      "signal": "No VBA or XLM macros found.",
+      "stderr_tail": null
+    }
+  },
+  {
+    "sample": "4_plain_macro.docm",
+    "size": 21339,
+    "magic_ole": false,
+    "magic_zip": true,
+    "header_hex": "504b030414000600",
+    "ft_container": "OpenXML",
+    "ft_filetype": "Word2007_DOCM",
+    "msoffcrypto": {
+      "class": "OOXMLFile",
+      "is_encrypted": false,
+      "exception": null
+    },
+    "crypto_is_encrypted": false,
+    "oleid": {
+      "encrypted": false,
+      "encrypted_desc": "The file is not encrypted",
+      "vba_macros": "Yes",
+      "xlm_macros": "No",
+      "file_format": "MS Word 2007+ Macro-Enabled Document (.docm)",
+      "container": "OpenXML"
+    },
+    "olevba": {
+      "returncode": 0,
+      "macro_modules_found": 4,
+      "signal": null,
+      "stderr_tail": null
+    }
+  }
+]
