@@ -608,6 +608,9 @@ class XmlParser(object):
                 log('  xml-parsing for {0} failed ({1}). '
                     .format(subfile, err) +
                     'Run iter_non_xml to investigate.')
+                # parse error may occur midway through the document, leaving
+                # depth unbalanced; reset it so the check below does not fail
+                depth = 0
             assert(depth == 0)
 
     def get_content_types(self):

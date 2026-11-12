@@ -50,6 +50,7 @@ import os
 import re
 import sys
 import io
+from collections import namedtuple
 from zipfile import is_zipfile
 import random
 
@@ -89,6 +90,9 @@ from oletools.common.io_encoding import ensure_stdout_handles_unicode
 # 2018-10-30       SA: - added detection of external links (PR #317)
 # 2020-03-03 v0.56 PL: - fixed bug #541, "Ole10Native" is case-insensitive
 # 2022-01-28 v0.60 PL: - added detection of customUI tags
+# 2026-11-12          - relationship report now includes source part,
+#                        relationship type and raw target of every
+#                        relationship, marking internal references
 
 __version__ = '0.60.1'
 
@@ -804,20 +808,86 @@ def find_ole(filename, data, xml_parser=None):
             ole.close()
 
 
+#: relationship target modes (ECMA-376 Part 1, 8.4.2.2: default is Internal)
+RELATIONSHIP_TARGET_MODE_INTERNAL = 'Internal'
+RELATIONSHIP_TARGET_MODE_EXTERNAL = 'External'
+
+#: a single relationship found in an OOXML file, with all the context needed
+#: to tell where a link comes from:
+#: - source_part: name of the .rels subfile the relationship was found in
+#:   (None for single-xml Office 2003 files)
+#: - rel_id: value of the Id attribute (e.g. "rId5"), None if missing
+#: - rel_type: last segment of the Type attribute (e.g. "hyperlink"),
+#:   None if missing
+#: - target: raw, unresolved value of the Target attribute, None if missing
+#: - target_mode: value of TargetMode, defaulting to "Internal" (ECMA-376)
+#: - is_external: True if target_mode is "External"
+RelationshipRecord = namedtuple('RelationshipRecord', [
+    'source_part', 'rel_id', 'rel_type', 'target', 'target_mode',
+    'is_external'])
+
+
+def find_relationships(xml_parser):
+    """ iterate XML files looking for relationships, external and internal
+
+    yields a RelationshipRecord for every Relationship element found in the
+    file, so callers can report the source part, relationship type and raw
+    target of each link, and tell mere internal references from external
+    links. Relationships with missing attributes are yielded with the
+    corresponding fields set to None instead of being dropped silently.
+
+    All evidence is extracted from the document itself; no network access of
+    any kind is performed.
+    """
+    for subfile, elem, _ in xml_parser.iter_xml(None, False,
+                                                OOXML_RELATIONSHIP_TAG):
+        attrib = getattr(elem, 'attrib', None)
+        if attrib is None:
+            continue
+        rel_type_full = attrib.get('Type')
+        rel_type = rel_type_full.rsplit('/', 1)[-1] if rel_type_full else None
+        target_mode = attrib.get('TargetMode',
+                                 RELATIONSHIP_TARGET_MODE_INTERNAL)
+        yield RelationshipRecord(
+            source_part=subfile,
+            rel_id=attrib.get('Id'),
+            rel_type=rel_type,
+            target=attrib.get('Target'),
+            target_mode=target_mode,
+            is_external=(target_mode == RELATIONSHIP_TARGET_MODE_EXTERNAL),
+        )
+
+
+def describe_relationship(record):
+    """ one-line human-readable description of a RelationshipRecord """
+    source = record.source_part if record.source_part else '(main document)'
+    rel_type = "'{0}'".format(record.rel_type) if record.rel_type \
+        else 'unknown (incomplete relationship)'
+    if record.target is None:
+        target = 'no target (incomplete relationship)'
+    else:
+        target = "target '{0}'".format(record.target)
+    mode = 'external link' if record.is_external else 'internal reference'
+    return "Found relationship in {0}: type {1}, {2} [{3}]" \
+           .format(source, rel_type, target, mode)
+
+
 def find_external_relationships(xml_parser):
     """ iterate XML files looking for relationships to external objects
-    """
-    for _, elem, _ in xml_parser.iter_xml(None, False, OOXML_RELATIONSHIP_TAG):
-        try:
-            if elem.attrib['TargetMode'] == 'External':
-                relationship_type = elem.attrib['Type'].rsplit('/', 1)[1]
 
-                if relationship_type in BLACKLISTED_RELATIONSHIP_TYPES:
-                    yield relationship_type, elem.attrib['Target']
-        except (AttributeError, KeyError):
+    yields 2-tuples (relationship type, target) for external relationships
+    of blacklisted types. Use find_relationships for a full report including
+    source parts and internal references.
+    """
+    for record in find_relationships(xml_parser):
+        if not record.is_external:
+            continue
+        if record.target is None:
             # ignore missing attributes - Word won't detect
             # external links anyway
-            pass
+            continue
+        if record.rel_type in BLACKLISTED_RELATIONSHIP_TYPES:
+            yield record.rel_type, record.target
 
 
 def find_customUI(xml_parser):
@@ -871,11 +941,13 @@ def process_file(filename, data, output_dir=None):
         log.info('file could be an OOXML file, looking for relationships with '
                  'external links')
         xml_parser = XmlParser(filename)
-        for relationship, target in find_external_relationships(xml_parser):
-            did_dump = True
-            print("Found relationship '%s' with external link %s" % (relationship, target))
-            if target.startswith('mhtml:'):
-                print("Potential exploit for CVE-2021-40444")
+        for record in find_relationships(xml_parser):
+            print(describe_relationship(record))
+            if record.is_external and record.target is not None \
+                    and record.rel_type in BLACKLISTED_RELATIONSHIP_TYPES:
+                did_dump = True
+                if record.target.startswith('mhtml:'):
+                    print("Potential exploit for CVE-2021-40444")
         for target in find_customUI(xml_parser):
             did_dump = True
             print("Found customUI tag with external link or VBA macro %s (possibly exploiting CVE-2021-42292)" % target)
